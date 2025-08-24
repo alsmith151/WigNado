@@ -17,7 +17,7 @@ python-source = "src"
 
 [project.optional-dependencies]
 # Extras to enable TileDB-backed functionality and heavy deps
-tiledb = ["tiledb", "polars", "pybigtools", "pydantic", "numba", "rich", "loguru", 'typer', "psutil"]
+tiledb = ["tiledb", "polars", "pybigtools", "pydantic", "numba", "rich", "loguru", 'typer', "psutil", 'numpy']
 
 [project.scripts]
 wignado = "wignado.cli:main"
