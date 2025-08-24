@@ -10,8 +10,23 @@ except Exception:  # pragma: no cover - extension optional
     _rust = None
 
 from . import utils
-
-__all__ = ["load_engine", "utils"]
+try:  # optional
+    from .zarrstore import (
+        bigwig_to_zarr,
+        BigWigToZarrConverter,
+        ZarrQueryEngine,
+        ZarrConverterConfig,
+    )
+    __all__ = [
+        "load_engine",
+        "utils",
+        "bigwig_to_zarr",
+        "BigWigToZarrConverter",
+        "ZarrQueryEngine",
+        "ZarrConverterConfig",
+    ]
+except Exception:  # pragma: no cover
+    __all__ = ["load_engine", "utils"]
 
 
 def load_engine():

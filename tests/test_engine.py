@@ -37,16 +37,22 @@ def import_engine_with_stubs():
         },
     )
 
-    _ensure_stub("bigtools", {})
-    _ensure_stub(
-        "loguru",
-        {
-            "logger": type(
-                "_L",
-                (),
-            )(),
-        },
-    )
+    # Engine imports pybigtools (not bigtools); provide stub if missing
+    _ensure_stub("pybigtools", {"open": lambda *a, **k: types.SimpleNamespace(chroms=lambda: {})})
+
+    class _LoggerStub:
+        def info(self, *a, **k):
+            pass
+        def warning(self, *a, **k):
+            pass
+        def error(self, *a, **k):
+            pass
+        def remove(self, *a, **k):
+            pass
+        def add(self, *a, **k):
+            pass
+
+    _ensure_stub("loguru", {"logger": _LoggerStub()})
 
     # Provide minimal psutil.cpu_count if psutil missing
     if importlib.util.find_spec("psutil") is None:

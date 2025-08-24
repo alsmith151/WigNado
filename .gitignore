@@ -3,3 +3,4 @@ target/
 **/*.dylib
 __pycache__/
 *.db/*
+*.zarr
