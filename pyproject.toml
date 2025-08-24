@@ -7,8 +7,8 @@ name = "wignado"
 version = "0.1.0"
 description = "WigNado: mixed Rust/Python genomic toolkit"
 readme = "README.md"
-authors = [ { name = "Your Name" } ]
-requires-python = ">=3.8"
+authors = [{ name = "Your Name" }]
+requires-python = ">=3.10"
 
 [tool.maturin]
 module-name = "wignado._wignado"
@@ -17,5 +17,7 @@ python-source = "src"
 
 [project.optional-dependencies]
 # Extras to enable TileDB-backed functionality and heavy deps
-tiledb = ["tiledb", "polars", "bigtools", "pydantic", "numba", "rich", "loguru"]
+tiledb = ["tiledb", "polars", "pybigtools", "pydantic", "numba", "rich", "loguru"]
 
+[project.scripts]
+wignado = "wignado.cli:main"
