@@ -13,19 +13,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 import warnings
-import gc
 
 try:
     import pybigtools
 except Exception:  # pragma: no cover - optional dependency
     pybigtools = None
     warnings.warn("pybigtools is not installed; fallback code paths will be limited")
-
-try:
-    import bigtools
-except Exception:  # pragma: no cover - optional dependency
-    bigtools = None
-    warnings.warn("bigtools is not installed; high-performance conversion disabled")
 
 import numpy as np
 import psutil
@@ -46,6 +39,10 @@ from numba import jit, prange
 from pydantic import BaseModel, Field, field_validator
 from rich.console import Console
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+# thread-local storage for per-thread bigWig handles
+_THREAD_LOCAL = threading.local()
 from rich.progress import (
     BarColumn, Progress, SpinnerColumn, TaskProgressColumn,
     TextColumn, TimeRemainingColumn
@@ -115,6 +112,8 @@ class ConverterConfig(BaseModel):
     memory_limit_gb: float = Field(default=16.0, gt=0.0)
     cache_size_gb: float = Field(default=4.0, gt=0.0)
     use_polars: bool = Field(default=True)
+    use_integer_contig_map: bool = Field(default=False)
+    write_batch_size: int = Field(default=64, ge=1)
 
     def __str__(self) -> str:
         return f"Config(chunk={self.chunk_size:,}, tile={self.tile_size:,}, workers={self.max_workers})"
@@ -267,115 +266,7 @@ def compute_chunk_statistics(values: np.ndarray) -> tuple[float, float, float, i
     return mean_val, max_val, min_val, valid_count
 
 
-class BigWigToTileDBConverter:
-    """Converter class that orchestrates reading a bigWig file (via py)
-
-    and writing an optimized TileDB schema.
-
-    This class focuses on orchestration; heavy-lifting helper methods are
-    expected to exist (for example, _read_chromosome_info_fast,
-    _create_optimized_schema, _convert_with_rich_progress).
-    """
-
-    def __init__(
-        self,
-        bigwig_path: Path | str,
-        tiledb_path: Path | str,
-        config: ConverterConfig | None = None,
-    ):
-        self.bigwig_path = Path(bigwig_path)
-        self.tiledb_path = Path(tiledb_path)
-        self.config = config or ConverterConfig()
-
-        if not self.bigwig_path.exists():
-            raise FileNotFoundError(f"BigWig file not found: {self.bigwig_path}")
-
-        try:
-            with pybigtools.open(str(self.bigwig_path)) as bw:
-                _ = bw.chroms()
-        except Exception as e:
-            raise ValueError(f"Invalid BigWig file: {e}")
-
-        logger.info(
-            f"BigTools converter initialized: {self.bigwig_path.name} → {self.tiledb_path.name}"
-        )
-        logger.info(str(self.config))
-
-    def run_conversion(self) -> ConversionMetrics:
-        """Execute the conversion pipeline and return collected metrics."""
-        start_time = time.perf_counter()
-
-        with console.status("[bold green]Reading chromosome information..."):
-            chromosomes = self._read_chromosome_info()
-            total_bp = sum(chrom.length for chrom in chromosomes)
-
-        logger.info(f"Found {len(chromosomes)} chromosomes, {total_bp:,} total bp")
-
-        with console.status("[bold green]Creating TileDB schema..."):
-            self._create_optimized_schema(chromosomes)
-
-        stats = self._convert_with_rich_progress(chromosomes)
-
-        total_time = time.perf_counter() - start_time
-        stats.total_time_seconds = total_time
-        return stats
-
-    def _read_chromosome_info(self) -> list[ContigInfo]:
-        """Read chromosome/contig sizes from the BigWig file and return a list
-        of `ContigInfo` objects. This uses `pybigtools`'s `chroms()` if
-        available and falls back gracefully.
-        """
-        contigs: list[ContigInfo] = []
-        try:
-            with pybigtools.open(str(self.bigwig_path)) as bw:
-                chroms = bw.chroms()
-        except Exception:
-            # If chroms() fails, re-raise a clearer error
-            raise RuntimeError("Failed to read chromosome information from BigWig")
-
-        # croms() might return dict-like or iterable of tuples
-        if isinstance(chroms, dict):
-            items = chroms.items()
-        else:
-            try:
-                items = list(chroms)
-            except Exception:
-                raise RuntimeError("Unsupported chromosome listing returned by pybigtools")
-
-        for it in items:
-            if isinstance(it, tuple) and len(it) >= 2:
-                name, length = it[0], int(it[1])
-            else:
-                # unexpected shape, try to convert
-                name = str(it)
-                length = 0
-            contigs.append(ContigInfo(name=name, length=length))
-        return contigs
-
-    def _create_optimized_schema(self, chromosomes: list[ContigInfo]) -> None:
-        """Create or plan an optimized TileDB schema for the provided
-        chromosomes. This implementation only logs the plan; a full
-        implementation would call tiledb APIs and create arrays.
-        """
-        logger.info(f"Planning TileDB schema for {len(chromosomes)} contigs")
-
-    def _convert_with_rich_progress(self, chromosomes: list[ContigInfo]) -> ConversionMetrics:
-        """Placeholder conversion worker.
-
-        Iterates contigs and synthesizes simple metrics. A production
-        implementation would stream values and write to TileDB here.
-        """
-        stats = ConversionMetrics()
-        for chrom in chromosomes:
-            # Simulate processing one chunk per contig
-            stats.chunks_processed += 1
-            stats.total_values += chrom.length
-            stats.total_bytes += chrom.length * 4  # assume 4 bytes/value
-        stats.compression_ratio = 1.0
-        return stats
-
-
-class BigToolsTileDBConverter:
+class BigwigToTileDBConverter:
     """Ultra-high performance converter using BigTools (Rust backend).
 
     This class expects the optional heavy dependencies (bigtools, tiledb,
@@ -398,7 +289,7 @@ class BigToolsTileDBConverter:
 
         # Validate BigWig file
         try:
-            with bigtools.open(str(self.bigwig_path)) as bw:
+            with pybigtools.open(str(self.bigwig_path)) as bw:
                 _ = bw.chroms()
         except Exception as e:
             raise ValueError(f"Invalid BigWig file: {e}")
@@ -418,11 +309,17 @@ class BigToolsTileDBConverter:
         logger.info(f"Found {len(chromosomes)} chromosomes, {total_bp:,} total bp")
 
         # Step 2: Create optimized schema
+        # optionally create a numeric contig map to avoid string dimensions
+        if self.config.use_integer_contig_map:
+            self._contig_map = {c.name: i for i, c in enumerate(chromosomes)}
+        else:
+            self._contig_map = None
+
         with console.status("[bold green]Creating TileDB schema..."):
             self._create_optimized_schema(chromosomes)
 
         # Step 3: Convert with progress tracking
-        stats = self._convert_with_rich_progress(chromosomes)
+        stats = self._convert(chromosomes)
 
         # Finalize stats
         total_time = time.perf_counter() - start_time
@@ -439,7 +336,7 @@ class BigToolsTileDBConverter:
     def _read_chromosome_info_fast(self) -> list[ContigInfo]:
         """Fast chromosome reading with BigTools"""
         chromosomes: list[ContigInfo] = []
-        with bigtools.open(str(self.bigwig_path)) as bw:
+        with pybigtools.open(str(self.bigwig_path)) as bw:
             chroms_dict = bw.chroms()
             for name, length in chroms_dict.items():
                 if length < 1000:
@@ -476,7 +373,11 @@ class BigToolsTileDBConverter:
             'sm.compute_concurrency_level': str(self.config.max_workers),
         })
 
-        chrom_dim = tiledb.Dim(name="chromosome", domain=(None, None), dtype="ascii", tile=max_chrom_len + 10)
+        if self.config.use_integer_contig_map:
+            # use numeric contig IDs (sparse) to avoid string dtype overhead
+            chrom_dim = tiledb.Dim(name="chromosome", domain=(0, len(chromosomes) - 1), dtype=np.uint32, tile=1)
+        else:
+            chrom_dim = tiledb.Dim(name="chromosome", domain=(None, None), dtype="ascii", tile=max_chrom_len + 10)
 
         optimal_tile_size = min(self.config.tile_size, max(1000, max_position // 10000))
 
@@ -493,56 +394,165 @@ class BigToolsTileDBConverter:
 
         value_attr = tiledb.Attr(name="value", dtype=np.float32, filters=filters)
 
-        schema = tiledb.ArraySchema(domain=domain, attrs=[value_attr], sparse=False, capacity=self.config.buffer_size, cell_order='row-major', tile_order='row-major', ctx=ctx)
+        # When using a string 'chromosome' dimension the array must be sparse
+        # because dense arrays require all dims to share the same primitive dtype.
+        schema = tiledb.ArraySchema(
+            domain=domain,
+            attrs=[value_attr],
+            sparse=True,
+            capacity=self.config.buffer_size,
+            ctx=ctx,
+        )
 
         tiledb.Array.create(str(self.tiledb_path), schema, ctx=ctx)
-        logger.info(f"Created TileDB array with tile size {optimal_tile_size:,}")
+        logger.info(f"Created sparse TileDB array with tile size {optimal_tile_size:,}")
 
-    def _convert_with_rich_progress(self, chromosomes: list[ContigInfo]) -> ConversionMetrics:
+    def _convert(self, chromosomes: list[ContigInfo]) -> ConversionMetrics:
         """Convert with beautiful progress display and parallel processing"""
         chunks = self._generate_smart_chunks(chromosomes)
         stats = ConversionMetrics()
 
+        # Partition chunks into per-worker batches to reduce executor overhead
+        num_workers = max(1, min(self.config.max_workers, len(chunks)))
+
+        chunk_batches = self._partition_chunks(chunks, num_workers)
+
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(bar_width=40), TaskProgressColumn(), TimeRemainingColumn(), TextColumn("[bold blue]{task.fields[throughput]}"), console=console, refresh_per_second=4) as progress:
             task = progress.add_task("Converting genomic data", total=len(chunks), throughput="0 MB/s")
 
-            with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
-                future_to_chunk = {executor.submit(self._process_chunk_bigtools, chunk_info): chunk_info for chunk_info in chunks}
+            start_time = time.perf_counter()
+            total_bytes = 0
 
-                with tiledb.open(str(self.tiledb_path), 'w') as tdb_array:
-                    completed_chunks = 0
-                    total_bytes = 0
-                    start_time = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(self._worker_process_chunks, batch, progress, task) for batch in chunk_batches]
 
-                    for future in as_completed(future_to_chunk):
-                        chunk_info = future_to_chunk[future]
-                        try:
-                            chunk_result = future.result(timeout=60)
-                            if chunk_result is not None:
-                                self._write_chunk_to_tiledb(tdb_array, chunk_result)
-                                stats.chunks_processed += 1
-                                stats.total_values += chunk_result['value_count']
-                                chunk_bytes = chunk_result['value_count'] * 4
-                                stats.total_bytes += chunk_bytes
-                                total_bytes += chunk_bytes
-                            else:
-                                stats.chunks_failed += 1
-                        except Exception as e:
-                            logger.error(f"Chunk {chunk_info} failed: {e}")
-                            stats.chunks_failed += 1
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        # result is a dict of aggregated stats from that worker
+                        stats.chunks_processed += result.get('chunks_processed', 0)
+                        stats.chunks_failed += result.get('chunks_failed', 0)
+                        stats.total_values += result.get('total_values', 0)
+                        bytes_written = result.get('total_bytes', 0)
+                        stats.total_bytes += bytes_written
+                        total_bytes += bytes_written
+                    except Exception as e:
+                        logger.error(f"Worker failed: {e}")
 
-                        completed_chunks += 1
-                        elapsed_time = time.perf_counter() - start_time
-                        if elapsed_time > 0:
-                            throughput_mbps = (total_bytes / 1024**2) / elapsed_time
-                            progress.update(task, completed=completed_chunks, throughput=f"{throughput_mbps:.1f} MB/s")
-                        else:
-                            progress.update(task, completed=completed_chunks)
-
-                        if completed_chunks % 100 == 0:
-                            gc.collect()
+                    elapsed_time = time.perf_counter() - start_time
+                    if elapsed_time > 0:
+                        throughput_mbps = (total_bytes / 1024**2) / elapsed_time
+                        progress.update(task, advance=0, throughput=f"{throughput_mbps:.1f} MB/s")
 
         return stats
+
+    def _partition_chunks(self, chunks: list[Tuple[str, int, int]], n: int) -> list[list[Tuple[str, int, int]]]:
+        """Split chunks into n roughly-equal batches."""
+        batches: list[list[Tuple[str, int, int]]] = [[] for _ in range(n)]
+        for i, c in enumerate(chunks):
+            batches[i % n].append(c)
+        return [b for b in batches if b]
+
+    def _worker_process_chunks(self, chunks: list[Tuple[str, int, int]], progress: Progress, task_id: int) -> Dict[str, int]:
+        """Worker that processes a list of chunks, writes them in-batch, and returns aggregated stats.
+
+        Each worker opens its own bigWig handle and TileDB array writer so there is minimal cross-thread contention.
+        """
+        local_stats = {'chunks_processed': 0, 'chunks_failed': 0, 'total_values': 0, 'total_bytes': 0}
+
+        # per-worker bigWig handle
+        bw_handle = None
+        try:
+            if pybigtools is not None:
+                bw_handle = pybigtools.open(str(self.bigwig_path))
+                _THREAD_LOCAL.bw_handle = bw_handle
+
+            # Open a TileDB array per worker for batched writes
+            tdb_array = None
+            if tiledb is not None:
+                tdb_array = tiledb.open(str(self.tiledb_path), 'w')
+
+            bytes_written = 0
+
+            # buffered writes to reduce per-chunk write overhead
+            buf_chroms: list = []
+            buf_positions: list = []
+            buf_values: list = []
+            buf_count = 0
+
+            for idx, chunk in enumerate(chunks):
+                chunk_result = self._process_chunk_bigtools(chunk)
+                if chunk_result is None:
+                    local_stats['chunks_failed'] += 1
+                    continue
+
+                buf_chroms.append(chunk_result['chromosomes'])
+                buf_positions.append(chunk_result['positions'])
+                buf_values.append(chunk_result['values'])
+                buf_count += 1
+
+                try:
+                    if buf_count >= self.config.write_batch_size and tdb_array is not None:
+                        # concatenate and write in a single operation
+                        all_chrom = np.concatenate(buf_chroms)
+                        all_pos = np.concatenate(buf_positions)
+                        all_vals = np.concatenate(buf_values)
+                        tdb_array[all_chrom, all_pos] = all_vals
+                        cb = all_vals.size * 4
+                        local_stats['chunks_processed'] += buf_count
+                        local_stats['total_values'] += all_vals.size
+                        local_stats['total_bytes'] += cb
+                        bytes_written += cb
+                        # reset buffers
+                        buf_chroms = []
+                        buf_positions = []
+                        buf_values = []
+                        buf_count = 0
+                except Exception as e:
+                    logger.error(f"Worker batched write failed: {e}")
+                    local_stats['chunks_failed'] += buf_count
+                    buf_chroms = []
+                    buf_positions = []
+                    buf_values = []
+                    buf_count = 0
+
+                # update progress every 16 chunks to reduce contention
+                if (idx & 0x0F) == 0:
+                    progress.update(task_id, advance=16 if (idx + 16) <= len(chunks) else 1)
+
+            # flush remaining buffers
+            if buf_count > 0 and tdb_array is not None:
+                try:
+                    all_chrom = np.concatenate(buf_chroms)
+                    all_pos = np.concatenate(buf_positions)
+                    all_vals = np.concatenate(buf_values)
+                    tdb_array[all_chrom, all_pos] = all_vals
+                    cb = all_vals.size * 4
+                    local_stats['chunks_processed'] += buf_count
+                    local_stats['total_values'] += all_vals.size
+                    local_stats['total_bytes'] += cb
+                    bytes_written += cb
+                except Exception as e:
+                    logger.error(f"Worker flush write failed: {e}")
+                    local_stats['chunks_failed'] += buf_count
+
+            # final progress update for any remainder
+            progress.update(task_id, advance=0)
+
+        finally:
+            try:
+                if bw_handle is not None:
+                    bw_handle.close()
+                    _THREAD_LOCAL.bw_handle = None
+            except Exception:
+                pass
+            try:
+                if tdb_array is not None:
+                    tdb_array.close()
+            except Exception:
+                pass
+
+        return local_stats
 
     def _generate_smart_chunks(self, chromosomes: list[ContigInfo]) -> list[Tuple[str, int, int]]:
         chunks: list[Tuple[str, int, int]] = []
@@ -560,50 +570,56 @@ class BigToolsTileDBConverter:
 
     def _process_chunk_bigtools(self, chunk_info: Tuple[str, int, int]) -> Optional[Dict[str, Any]]:
         chrom, start, end = chunk_info
+
+        # Try to reuse a per-thread bigWig handle to avoid repeated open()/close().
+        bw_handle = getattr(_THREAD_LOCAL, 'bw_handle', None)
+
         try:
-            with bigtools.open(str(self.bigwig_path)) as bw:
-                try:
-                    values = bw.values(chrom, start, end)
-                except Exception:
-                    return None
-                if values is None or len(values) == 0:
-                    return None
-                cleaned_values = normalize_genomic_values(values.astype(np.float64))
-                mean_val, max_val, min_val, valid_count = compute_chunk_statistics(cleaned_values)
-                if valid_count == 0:
-                    return None
-                if self.config.use_polars:
-                    positions = np.arange(start, start + len(cleaned_values), dtype=np.uint64)
-                    df = pl.DataFrame({
-                        "chromosome": [chrom] * len(cleaned_values),
-                        "position": positions,
-                        "value": cleaned_values,
-                    })
-                    non_zero_df = df.filter(pl.col("value") != 0.0)
-                    if len(non_zero_df) == 0:
-                        return None
-                    return {
-                        'chromosomes': non_zero_df['chromosome'].to_numpy(),
-                        'positions': non_zero_df['position'].to_numpy(),
-                        'values': non_zero_df['value'].to_numpy(),
-                        'value_count': len(non_zero_df),
-                        'stats': {'mean': mean_val, 'max': max_val, 'min': min_val},
-                    }
+            if bw_handle is None:
+                # If pybigtools is available create a persistent handle per-thread.
+                if pybigtools is not None:
+                    bw_handle = pybigtools.open(str(self.bigwig_path))
+                    _THREAD_LOCAL.bw_handle = bw_handle
+                    values = bw_handle.values(chrom, start, end)
                 else:
-                    positions = np.arange(start, start + len(cleaned_values), dtype=np.uint64)
-                    chromosomes = np.full(len(positions), chrom, dtype=f'U{len(chrom)}')
-                    return {
-                        'chromosomes': chromosomes,
-                        'positions': positions,
-                        'values': cleaned_values,
-                        'value_count': len(cleaned_values),
-                        'stats': {'mean': mean_val, 'max': max_val, 'min': min_val},
-                    }
-        except Exception as e:
-            logger.warning(f"Failed to process {chrom}:{start:,}-{end:,}: {e}")
+                    # Fallback: open, read, and close immediately
+                    with pybigtools.open(str(self.bigwig_path)) as bw:
+                        values = bw.values(chrom, start, end)
+            else:
+                values = bw_handle.values(chrom, start, end)
+        except Exception:
             return None
 
-    def _write_chunk_to_tiledb(self, array: tiledb.Array, chunk_data: Dict[str, Any]) -> None:
+        if values is None or len(values) == 0:
+            return None
+
+        # Normalize in-place and cast to float32 to reduce memory
+        cleaned_values = normalize_genomic_values(values.astype(np.float64)).astype(np.float32)
+
+        mean_val, max_val, min_val, valid_count = compute_chunk_statistics(cleaned_values)
+        if valid_count == 0:
+            return None
+
+        # Fast numpy-first filtering (avoid constructing Polars DataFrames in the hot path)
+        nonzero_mask = cleaned_values != 0.0
+        if not nonzero_mask.any():
+            return None
+
+        positions = np.nonzero(nonzero_mask)[0].astype(np.uint64) + np.uint64(start)
+        values_out = cleaned_values[nonzero_mask]
+
+        # Create chromosome array matching positions length. Use unicode dtype sized to name length.
+        chrom_arr = np.full(len(positions), chrom, dtype=f'U{len(chrom)}')
+
+        return {
+            'chromosomes': chrom_arr,
+            'positions': positions,
+            'values': values_out,
+            'value_count': len(values_out),
+            'stats': {'mean': mean_val, 'max': max_val, 'min': min_val},
+        }
+
+    def _write_chunk_to_tiledb(self, array: Any, chunk_data: Dict[str, Any]) -> None:
         try:
             array[chunk_data['chromosomes'], chunk_data['positions']] = chunk_data['values']
         except Exception as e:
@@ -634,3 +650,76 @@ class BigToolsTileDBConverter:
         if stats.compression_ratio > 0:
             table.add_row("Compression", f"{stats.compression_ratio:.1f}x", "ratio")
         console.print(table)
+
+
+class TileDBQueryEngine:
+    """Simple query API for TileDB-backed genomic signal.
+
+    Provides a small, testable surface: query_region and bench_queries.
+    If `tiledb` is not installed the methods raise a clear error.
+    """
+
+    def __init__(self, tiledb_path: Path | str):
+        self.tiledb_path = Path(tiledb_path)
+        if tiledb is None:
+            raise RuntimeError("TileDB is not installed; TileDBQueryEngine unavailable")
+
+    def query_region(self, chrom: str | int, start: int, end: int) -> np.ndarray:
+        """Return values for a region as a numpy array of floats.
+
+        If contigs are stored as integer IDs, the caller should pass the
+        numeric chrom ID. This method always returns positions and values
+        aligned to [start, end).
+        """
+        if not self.tiledb_path.exists():
+            raise FileNotFoundError(f"TileDB array not found: {self.tiledb_path}")
+
+        with tiledb.open(str(self.tiledb_path), 'r') as arr:
+            # Support both sparse and dense arrays; attempt a simple coordinate read
+            try:
+                coords = (chrom, np.arange(start, end, dtype=np.uint64))
+                vals = arr[coords]
+            except Exception:
+                # Fallback: read ranged query using queries API
+                q = arr.query()
+                q.set_ranges('position', [(start, end - 1)])
+                q.set_ranges('chromosome', [(chrom, chrom)])
+                df = q.df[:]
+                if df is None or len(df) == 0:
+                    return np.array([], dtype=np.float32)
+                return df['value'].to_numpy(dtype=np.float32)
+
+            if vals is None:
+                return np.array([], dtype=np.float32)
+
+            # TileDB may return an OrderedDict or mapping of attribute -> values
+            if isinstance(vals, dict):
+                # Prefer attribute named 'value', otherwise take first attribute
+                if 'value' in vals:
+                    vals = vals['value']
+                else:
+                    # OrderedDict -> take first value array
+                    first = next(iter(vals.values()), None)
+                    vals = first if first is not None else np.array([], dtype=np.float32)
+
+            # If vals is a sequence of (pos, val) tuples, try to extract values
+            if isinstance(vals, (list, tuple)) and len(vals) > 0 and isinstance(vals[0], (list, tuple)):
+                try:
+                    vals = np.array([v for (_, v) in vals], dtype=np.float32)
+                except Exception:
+                    vals = np.asarray(vals, dtype=np.float32)
+
+            return np.asarray(vals, dtype=np.float32)
+
+    def bench_queries(self, queries: list[GenomicRegion], iterations: int = 3) -> QueryBenchmark:
+        """Run repeated queries and return a QueryBenchmark summary."""
+        times: list[float] = []
+        total_values = 0
+        for it in range(iterations):
+            t0 = time.perf_counter()
+            for q in queries:
+                vals = self.query_region(q.chrom, q.start, q.end)
+                total_values += len(vals)
+            times.append(time.perf_counter() - t0)
+
+        return QueryBenchmark(total_queries=len(queries), iterations=iterations, query_times=times, total_values_retrieved=total_values)

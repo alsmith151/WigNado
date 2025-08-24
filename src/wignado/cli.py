@@ -16,7 +16,7 @@ import numpy as np
 
 from .engine import (
     compute_chunk_statistics,
-    BigWigToTileDBConverter,
+    BigwigToTileDBConverter,
     ConverterConfig,
 )
 
@@ -67,9 +67,9 @@ def convert(
         typer.echo("Dry run: not executing conversion")
         raise typer.Exit()
 
-    conv = BigWigToTileDBConverter(bigwig, tiledb_path, config=config)
+    conv = BigwigToTileDBConverter(bigwig, tiledb_path, config=config)
     typer.echo("Starting conversion...")
-    metrics = conv.run_conversion()
+    metrics = conv.convert()
     typer.echo(f"Conversion complete: time={metrics.total_time_seconds:.2f}s, values={metrics.total_values}")
 
 

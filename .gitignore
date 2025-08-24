@@ -2,3 +2,4 @@ target/
 **/*.so
 **/*.dylib
 __pycache__/
+*.db/*
