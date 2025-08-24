@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 import warnings
 
-import bigtools
+import pybigtools
 import numpy as np
 import psutil
 from loguru import logger
@@ -238,7 +238,7 @@ def compute_chunk_statistics(values: np.ndarray) -> tuple[float, float, float, i
 
 
 class BigWigToTileDBConverter:
-    """Converter class that orchestrates reading a bigWig file (via bigtools)
+    """Converter class that orchestrates reading a bigWig file (via py)
 
     and writing an optimized TileDB schema.
 
@@ -261,7 +261,7 @@ class BigWigToTileDBConverter:
             raise FileNotFoundError(f"BigWig file not found: {self.bigwig_path}")
 
         try:
-            with bigtools.open(str(self.bigwig_path)) as bw:
+            with pybigtools.open(str(self.bigwig_path)) as bw:
                 _ = bw.chroms()
         except Exception as e:
             raise ValueError(f"Invalid BigWig file: {e}")
@@ -276,7 +276,7 @@ class BigWigToTileDBConverter:
         start_time = time.perf_counter()
 
         with console.status("[bold green]Reading chromosome information..."):
-            chromosomes = self._read_chromosome_info_fast()
+            chromosomes = self._read_chromosome_info()
             total_bp = sum(chrom.length for chrom in chromosomes)
 
         logger.info(f"Found {len(chromosomes)} chromosomes, {total_bp:,} total bp")
@@ -288,4 +288,58 @@ class BigWigToTileDBConverter:
 
         total_time = time.perf_counter() - start_time
         stats.total_time_seconds = total_time
+        return stats
+
+    def _read_chromosome_info(self) -> list[ContigInfo]:
+        """Read chromosome/contig sizes from the BigWig file and return a list
+        of `ContigInfo` objects. This uses `pybigtools`'s `chroms()` if
+        available and falls back gracefully.
+        """
+        contigs: list[ContigInfo] = []
+        try:
+            with pybigtools.open(str(self.bigwig_path)) as bw:
+                chroms = bw.chroms()
+        except Exception:
+            # If chroms() fails, re-raise a clearer error
+            raise RuntimeError("Failed to read chromosome information from BigWig")
+
+        # croms() might return dict-like or iterable of tuples
+        if isinstance(chroms, dict):
+            items = chroms.items()
+        else:
+            try:
+                items = list(chroms)
+            except Exception:
+                raise RuntimeError("Unsupported chromosome listing returned by pybigtools")
+
+        for it in items:
+            if isinstance(it, tuple) and len(it) >= 2:
+                name, length = it[0], int(it[1])
+            else:
+                # unexpected shape, try to convert
+                name = str(it)
+                length = 0
+            contigs.append(ContigInfo(name=name, length=length))
+        return contigs
+
+    def _create_optimized_schema(self, chromosomes: list[ContigInfo]) -> None:
+        """Create or plan an optimized TileDB schema for the provided
+        chromosomes. This implementation only logs the plan; a full
+        implementation would call tiledb APIs and create arrays.
+        """
+        logger.info(f"Planning TileDB schema for {len(chromosomes)} contigs")
+
+    def _convert_with_rich_progress(self, chromosomes: list[ContigInfo]) -> ConversionMetrics:
+        """Placeholder conversion worker.
+
+        Iterates contigs and synthesizes simple metrics. A production
+        implementation would stream values and write to TileDB here.
+        """
+        stats = ConversionMetrics()
+        for chrom in chromosomes:
+            # Simulate processing one chunk per contig
+            stats.chunks_processed += 1
+            stats.total_values += chrom.length
+            stats.total_bytes += chrom.length * 4  # assume 4 bytes/value
+        stats.compression_ratio = 1.0
         return stats
