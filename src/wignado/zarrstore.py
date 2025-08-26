@@ -248,6 +248,158 @@ class ZarrQueryEngine:
             mat[i] = self.query_binned(r, n_bins)
         return mat
 
+    # ------------------------------------------------------------------
+    # Chunk-aware parallel querying
+    # ------------------------------------------------------------------
+    def _dataset_and_id(self, chrom: str | int):
+        name, cid = self._resolve(chrom)
+        ds_name = f"c{cid}" if f"c{cid}" in self.data else name
+        return self.data[ds_name], cid, ds_name
+
+    def _split_region_into_chunks(self, region: GenomicRegion):
+        arr, cid, ds_name = self._dataset_and_id(region.chrom)
+        chunk_len = arr.chunks[0] if hasattr(arr, 'chunks') else arr.shape[0]
+        start = max(0, region.start)
+        end = min(int(self.chrom_sizes[cid]), region.end)
+        if end <= start:
+            return []
+        first_chunk = start // chunk_len
+        last_chunk = (end - 1) // chunk_len
+        pieces = []
+        for chunk_idx in range(first_chunk, last_chunk + 1):
+            c_start = chunk_idx * chunk_len
+            c_end = c_start + chunk_len
+            s = max(start, c_start)
+            e = min(end, c_end)
+            if e > s:
+                pieces.append({
+                    'cid': cid,
+                    'ds': ds_name,
+                    'chunk_idx': chunk_idx,
+                    'chunk_start': c_start,
+                    'start': s,
+                    'end': e,
+                    'region': region,
+                })
+        return pieces
+
+    def plan_regions_by_chunk(self, regions: Sequence[GenomicRegion]):
+        """Return a plan grouping region sub-spans by (dataset, chunk_index).
+
+        Each region spanning multiple chunks is split so that we only read
+        each chunk once per worker.
+        """
+        plan: dict[tuple[str,int], list[dict]] = {}
+        for r in regions:
+            for piece in self._split_region_into_chunks(r):
+                key = (piece['ds'], piece['chunk_idx'])
+                plan.setdefault(key, []).append(piece)
+        return plan
+
+    def query_multiple_regions_parallel(
+        self,
+        regions: Sequence[GenomicRegion],
+        max_workers: int = 4,
+        prefer_distinct_chunks: bool = True,
+        as_xarray: bool = False,
+        pad_value: float = np.nan,
+    ) -> dict[str, np.ndarray]:
+        """Parallel region querying minimizing overlapping chunk reads.
+
+        Strategy:
+          1. Split regions into per-chunk pieces.
+          2. Group pieces by chunk.
+          3. Schedule groups across a thread pool so workers mostly handle
+             disjoint chunks (round-robin) to reduce simultaneous access to
+             same underlying storage.
+
+                Returns:
+                        dict(region_str -> np.ndarray) by default.
+                        If as_xarray=True (and xarray installed), returns an xarray.Dataset
+                        with variable-length regions padded to 'pad_value'. Dimensions:
+                            - region: region index (with region string coordinate labels)
+                            - position: 0..(max_region_length-1) offset within region
+                        Dataset variables:
+                            - signal: (region, position) float32
+                            - length: (region,) original lengths
+        """
+        if not regions:
+            return {}
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        plan = self.plan_regions_by_chunk(regions)
+        # Pre-allocate containers for region assembly
+        region_parts: dict[str, list[tuple[int, np.ndarray]]] = {}
+
+        # Ordering of chunk groups: sort by dataset then chunk index
+        chunk_groups = sorted(plan.items(), key=lambda kv: (kv[0][0], kv[0][1]))
+        if prefer_distinct_chunks:
+            # Interleave groups to spread out adjacent chunk indices
+            even = chunk_groups[0::2]
+            odd = chunk_groups[1::2]
+            chunk_groups = even + odd
+
+        def process_group(key, pieces):
+            ds_name, chunk_idx = key
+            arr = self.data[ds_name]
+            chunk_len = arr.chunks[0] if hasattr(arr, 'chunks') else arr.shape[0]
+            c_start = chunk_idx * chunk_len
+            c_end = min(c_start + chunk_len, arr.shape[0])
+            # Load chunk slice once
+            chunk_view = arr[c_start:c_end]
+            out_local = []
+            for p in pieces:
+                local_s = p['start'] - c_start
+                local_e = p['end'] - c_start
+                sub = chunk_view[local_s:local_e]
+                out_local.append((p['region'], p['start'], sub))
+            return out_local
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(process_group, key, pieces) for key, pieces in chunk_groups]
+            for fut in as_completed(futures):
+                for region_obj, abs_start, sub_vals in fut.result():
+                    rid = str(region_obj)
+                    region_parts.setdefault(rid, []).append((abs_start, sub_vals))
+
+        # Assemble full arrays per region (pieces are non-overlapping)
+        result: dict[str, np.ndarray] = {}
+        for r in regions:
+            rid = str(r)
+            if rid not in region_parts:
+                result[rid] = np.empty(0, dtype=np.float32)
+                continue
+            pieces = sorted(region_parts[rid], key=lambda t: t[0])
+            vals = np.concatenate([p[1] for p in pieces]) if len(pieces) > 1 else pieces[0][1]
+            # Ensure float32 output
+            result[rid] = vals.astype(np.float32, copy=False)
+        if not as_xarray:
+            return result
+        # Build xarray Dataset
+        try:  # deferred import
+            import xarray as xr  # type: ignore
+        except ImportError as e:  # pragma: no cover
+            raise RuntimeError("xarray is required for as_xarray=True. Install via pip install xarray.") from e
+        region_ids = [str(r) for r in regions]
+        lengths = np.array([len(result.get(rid, [])) for rid in region_ids], dtype=np.int32)
+        max_len = int(lengths.max(initial=0))
+        data = np.full((len(region_ids), max_len), pad_value, dtype=np.float32)
+        for i, rid in enumerate(region_ids):
+            arr_vals = result.get(rid, np.empty(0, dtype=np.float32))
+            if arr_vals.size:
+                data[i, :arr_vals.size] = arr_vals.astype(np.float32, copy=False)
+        ds = xr.Dataset(
+            {
+                'signal': (('region', 'position'), data),
+                'length': (('region',), lengths),
+            },
+            coords={
+                'region': region_ids,
+                'position': np.arange(max_len, dtype=np.int32),
+            },
+            attrs={'source': 'wignado.zarrstore', 'pad_value': float(pad_value)},
+        )
+        return ds  # type: ignore[return-value]
+
 # --------------------------------------------------------------------------------------
 # Convenience function
 # --------------------------------------------------------------------------------------
