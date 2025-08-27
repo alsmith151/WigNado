@@ -13,9 +13,11 @@ class GenomicRegion(BaseModel):
     """
     model_config = {"validate_assignment": True, "extra": "forbid"}
 
+    name: str | None = Field(default=None, description="Optional region name/ID")
     chrom: str = Field(..., min_length=1)
     start: int = Field(..., ge=0)
     end: int = Field(..., gt=0)
+    
 
     @field_validator("end")
     @classmethod
