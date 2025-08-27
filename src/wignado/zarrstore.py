@@ -24,20 +24,19 @@ continuous. (For highly sparse signals prefer TileDB sparse schema.)
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence
+from typing import Literal
 import time
 
 import numpy as np
 from loguru import logger
-from pydantic import BaseModel, Field, field_validator, validator
+from pydantic import BaseModel, Field, model_validator, computed_field
 import tqdm
 from enum import Enum
 import pybigtools  # type: ignore
 import zarr  # type: ignore
 from numcodecs import Zstd  # type: ignore
-import xarray as xr  # type: ignore
 
-from .core import GenomicRegion
+from .core import GenomicRegion, RegionConfig, QueryConfig, ReferencePoint
 
 # --------------------------------------------------------------------------------------
 # Configuration dataclass
@@ -45,11 +44,21 @@ from .core import GenomicRegion
 
 
 class ValueDType(str, Enum):
+    """Enum of supported on-disk value dtypes.
+
+    Keeping as string Enum so values map cleanly to numpy dtype names.
+    """
     FLOAT32 = "float32"
     FLOAT16 = "float16"
 
 
 class ZarrConverterConfig(BaseModel):
+    """Configuration controlling BigWig -> Zarr conversion.
+
+    Parameters govern chunk sizing, compression, dtype, and filtering of
+    contigs. All values are validated by Pydantic. This object is serialised
+    verbatim into the Zarr root attrs (key: ``config``) for provenance.
+    """
     overwrite: bool = Field(
         False, description="Overwrite existing Zarr store if present"
     )
@@ -80,9 +89,29 @@ class ZarrConverterConfig(BaseModel):
 # --------------------------------------------------------------------------------------
 # Conversion
 # --------------------------------------------------------------------------------------
-
-
 class BigWigToZarrConverter:
+    """Stream a BigWig into a dense-per-contig Zarr hierarchy.
+
+    Typical usage:
+
+        >>> cfg = ZarrConverterConfig(chunk_size=500_000)
+        >>> BigWigToZarrConverter("signal.bw", "out.zarr", cfg).convert()
+
+    The resulting layout under ``out.zarr`` is:
+
+        contigs        (1D, str)
+        chrom_sizes    (1D, uint64)
+        data/<contig or cID>  (1D float array per chromosome)
+
+    Attributes
+    ----------
+    bigwig_path : Path
+        Source BigWig file.
+    zarr_path : Path
+        Destination directory (created if missing / overwritten if configured).
+    cfg : ZarrConverterConfig
+        Active conversion configuration.
+    """
     def __init__(
         self,
         bigwig_path: str | Path,
@@ -92,9 +121,9 @@ class BigWigToZarrConverter:
         self.bigwig_path = Path(bigwig_path)
         self.zarr_path = Path(zarr_path)
         self.cfg = config or ZarrConverterConfig()
-        self._validate()
+        self._validate_inputs()
 
-    def _validate(self) -> None:
+    def _validate_inputs(self) -> None:
         if not self.bigwig_path.exists():
             raise FileNotFoundError(f"BigWig file not found: {self.bigwig_path}")
         with pybigtools.open(str(self.bigwig_path)) as bw:  # sanity
@@ -276,22 +305,15 @@ class BigWigToZarrConverter:
 
 
 class ZarrQueryEngine:
-    """Query engine for a WigNado Zarr store.
-
-    Provides:
-      * Exact region extraction (optionally clamped to contig bounds)
-      * Mean-binned region summaries
-      * Multi-region querying (serial & chunk-aware parallel)
-
-    Notes
-    -----
-    This class assumes the Zarr layout produced by :class:`BigWigToZarrConverter`.
-    Public method signatures are kept minimal; internal helpers concentrate
-    repeated logic (dataset name resolution, bounds clamping, etc.).
-    """
+    """Read/query interface for a WigNado Zarr store."""
 
     # ---------------------------- construction ---------------------------------
-    def __init__(self, zarr_path: str | Path, region_config: RegionConfig):
+    def __init__(
+        self,
+        zarr_path: str | Path,
+        region_config: RegionConfig,
+        query_config: QueryConfig,
+    ):
         # Validate zarr exists
         self.zarr_path = Path(zarr_path)
         if not self.zarr_path.exists():
@@ -300,9 +322,14 @@ class ZarrQueryEngine:
         # Config for adjusting regions as they are processed
         self.region_config = region_config
 
+        # Config for query behavior
+        self.query_config = query_config
+
         # Load Zarr store & metadata
         self.root = zarr.open(str(self.zarr_path), mode="r")
         self.data = self.root["data"]
+
+        # Load contig metadata
         self.contigs = list(self.root["contigs"][:])
         chrom_sizes = np.asarray(self.root["chrom_sizes"][:], dtype=np.int64)
         self.contig_id_map: dict[str, int] = {
@@ -318,280 +345,379 @@ class ZarrQueryEngine:
                 self.id_to_name[idx] = name
         self.chrom_sizes = chrom_sizes
 
-    # --------------------------- internal helpers ------------------------------
-    def _resolve(
-        self, chrom: str | int, ignore_missing: bool = True
-    ) -> tuple[str, int | None]:
-        """Return (name, id) for a chromosome or (name, None) if missing & allowed."""
+    # ------------------------------------------------------------------
+    # Basic metadata helpers
+    # ------------------------------------------------------------------
+    def _resolve_chromosome(self, chrom: str | int) -> tuple[str, int | None]:
+        """Resolve a chromosome identifier.
+
+        Parameters
+        ----------
+        chrom : str | int
+            Chromosome name or numeric contig id.
+
+        Returns
+        -------
+        (name, id | None)
+            Returns the normalized name and its integer id. If the chromosome
+            is missing and missing chromosomes are tolerated, returns (name, None).
+        """
         if isinstance(chrom, int):
+            # Resolve integer chromosome ID
             if chrom < 0 or chrom >= len(self.id_to_name):
                 raise KeyError(f"Chromosome id {chrom} out of range")
+
             name = self.id_to_name[chrom]
+            # Return the resolved chromosome name and ID
             return name, chrom
+
         if chrom not in self.contig_id_map:
-            if ignore_missing:
-                logger.debug(f"Chromosome '{chrom}' missing from Zarr store")
-                return chrom, None
-            raise KeyError(f"Chromosome '{chrom}' missing")
+            if self.query_config.error_on_missing_chromosome:
+                raise KeyError(f"Chromosome '{chrom}' missing from Zarr store")
+            return chrom, None
+
+        # Return the resolved chromosome name and ID
         return chrom, self.contig_id_map[chrom]
 
-    def _dataset_name(self, cid: int, name: str) -> str:
-        coded = f"c{cid}"
-        return coded if coded in self.data else name
+    def get_chromosome_length(self, chrom: str | int) -> int | None:
+        """Return chrom length in bp or None if missing (and missing allowed)."""
+        _, chrom_id = self._resolve_chromosome(chrom)
+        if chrom_id is None:
+            return None
+        return int(self.chrom_sizes[chrom_id])
 
-    def _clamp_interval(self, cid: int, start: int, end: int) -> tuple[int, int, int]:
-        length = int(self.chrom_sizes[cid])
-        start_c = max(0, start)
-        end_c = min(length, end)
-        return start_c, end_c, length
+    def _expand_region(self, region: GenomicRegion) -> GenomicRegion | None:
+        """Transform an input region according to RegionConfig.
 
-    def _get_array(self, chrom: str | int):
-        name, cid = self._resolve(chrom)
-        if cid is None:
-            return None, None, None
-        ds_name = self._dataset_name(cid, name)
-        return self.data[ds_name], cid, ds_name
-
-    # ------------------------------------------------------------------
-    # Chunk-aware parallel querying
-    # ------------------------------------------------------------------
-    def _dataset_and_id(self, chrom: str | int):
-        name, cid = self._resolve(chrom)
-        ds_name = f"c{cid}" if f"c{cid}" in self.data else name
-        return self.data[ds_name], cid, ds_name
-
-    def _split_region_into_chunks(self, region: GenomicRegion):
-        arr, cid, ds_name = self._dataset_and_id(region.chrom)
-        chunk_len = arr.chunks[0] if hasattr(arr, "chunks") else arr.shape[0]
-        start = max(0, region.start)
-        end = min(int(self.chrom_sizes[cid]), region.end)
-        if end <= start:
-            return []
-        first_chunk = start // chunk_len
-        last_chunk = (end - 1) // chunk_len
-        pieces = []
-        for chunk_idx in range(first_chunk, last_chunk + 1):
-            c_start = chunk_idx * chunk_len
-            c_end = c_start + chunk_len
-            s = max(start, c_start)
-            e = min(end, c_end)
-            if e > s:
-                pieces.append(
-                    {
-                        "cid": cid,
-                        "ds": ds_name,
-                        "chunk_idx": chunk_idx,
-                        "chunk_start": c_start,
-                        "start": s,
-                        "end": e,
-                        "region": region,
-                    }
-                )
-        return pieces
-
-    def _plan_regions_by_chunk(self, regions: Sequence[GenomicRegion]):
-        """Return a plan grouping region sub-spans by (dataset, chunk_index).
-
-        Each region spanning multiple chunks is split so that we only read
-        each chunk once per worker.
+        For reference-point mode the window is centered / anchored relative to
+        the supplied region (interpreted as the raw genomic interval). For
+        scale-regions mode we extend outward by flanks + internal unscaled
+        segments producing a larger window from which we will later segment
+        and (optionally) scale the original body.
         """
-        plan: dict[tuple[str, int], list[dict]] = {}
-        for r in regions:
-            for piece in self._split_region_into_chunks(r):
-                key = (piece["ds"], piece["chunk_idx"])
-                plan.setdefault(key, []).append(piece)
-        return plan
-
-    def _result_to_xarray(
-        self,
-        regions: Sequence[GenomicRegion],
-        result: dict[str, np.ndarray],
-        pad_value: float,
-    ) -> "xr.Dataset":
-        region_ids = [str(r) for r in regions]
-        lengths = np.array(
-            [len(result.get(rid, [])) for rid in region_ids], dtype=np.int32
+        chrom_name, chrom_id = self._resolve_chromosome(region.chrom)
+        if chrom_id is None:
+            if self.query_config.error_on_missing_chromosome:
+                raise KeyError(f"Chromosome '{region.chrom}' missing from Zarr store")
+            return None
+        if self.region_config.mode == "reference-point":
+            if self.region_config.reference_point == ReferencePoint.START:
+                anchor = region.start
+            elif self.region_config.reference_point == ReferencePoint.END:
+                anchor = region.end
+            else:  # center / default
+                anchor = (region.start + region.end) // 2
+            new_start = anchor - self.region_config.bp_before
+            new_end = anchor + self.region_config.bp_after
+            if new_end < new_start:
+                new_end = new_start
+            return GenomicRegion(chrom=chrom_name, start=new_start, end=new_end)
+        # scale-regions: build outer window spanning flanks + body + internal unscaled segments
+        new_start = region.start - (
+            self.region_config.upstream + self.region_config.unscaled_5_prime
         )
-        max_len = int(lengths.max(initial=0))
-        data = np.full((len(region_ids), max_len), pad_value, dtype=np.float32)
-        for i, rid in enumerate(region_ids):
-            arr_vals = result.get(rid, np.empty(0, dtype=np.float32))
-            if arr_vals.size:
-                data[i, : arr_vals.size] = arr_vals.astype(np.float32, copy=False)
-        ds = xr.Dataset(
-            {
-                "signal": (("region", "position"), data),
-                "length": (("region",), lengths),
-            },
-            coords={
-                "region": region_ids,
-                "position": np.arange(max_len, dtype=np.int32),
-            },
-            attrs={"source": "wignado.zarrstore", "pad_value": float(pad_value)},
+        new_end = region.end + (
+            self.region_config.downstream + self.region_config.unscaled_3_prime
         )
-        return ds  # type: ignore[return-value]
+        if new_end < new_start:
+            new_end = new_start
+        return GenomicRegion(chrom=chrom_name, start=new_start, end=new_end)
 
-    # --------------------------- query API ------------------------------------
-    def _query_region(
-        self, chrom: str | int, start: int, end: int, *, clamp: bool = True
-    ) -> np.ndarray:
-        arr, cid, ds_name = self._get_array(chrom)
-        if cid is None:
-            return np.empty(0, dtype=np.float32)
-        if clamp:
-            start, end, _ = self._clamp_interval(cid, start, end)
+    # ------------------------------------------------------------------
+    # Low-level data access
+    # ------------------------------------------------------------------
+    def _dataset_name(self, chrom_id: int | None, chrom_name: str) -> str:
+        """Return concrete dataset name for a contig (id-coded if available)."""
+        if chrom_id is None:
+            return chrom_name
+        coded = f"c{chrom_id}"
+        return coded if coded in self.data else chrom_name
+
+    def _fetch_region(
+        self, region: GenomicRegion, *, expand: bool = True
+    ) -> tuple[np.ndarray, GenomicRegion | None]:
+        """Return (array, effective_region).
+
+        Parameters
+        ----------
+        region : GenomicRegion
+            User-supplied region or already-expanded region if expand=False.
+        expand : bool, default True
+            Whether to apply configured expansion / transformation first.
+
+        Notes
+        -----
+        The returned array is always a view (copy-on-write) of the stored
+        per-chromosome dense array (float32). Coordinates are clamped to
+        chromosome bounds. Missing chromosomes yield (empty_array, None).
+        """
+        effective = self._expand_region(region) if expand else region
+        if effective is None:
+            return np.empty(0, dtype=np.float32), None
+        chrom_name, chrom_id = self._resolve_chromosome(effective.chrom)
+        ds_name = self._dataset_name(chrom_id, chrom_name)
+        chrom_length = int(self.chrom_sizes[chrom_id])  # type: ignore[index]
+        start = max(0, effective.start)
+        end = min(effective.end, chrom_length)
         if end <= start:
-            return np.empty(0, dtype=arr.dtype)
-        return arr[start:end]
+            return np.empty(0, dtype=np.float32), effective
+        arr = self.data[ds_name]
+        return arr[start:end], effective
 
-    def _query_multiple_regions(
-        self, regions: Sequence[GenomicRegion]
-    ) -> dict[str, np.ndarray]:
-        out = {}
-        for r in tqdm.tqdm(regions):
-            out[str(r)] = self._query_region(r.chrom, r.start, r.end)
+    def _query_region(self, region: GenomicRegion, expand: bool = False) -> np.ndarray:
+        """Public-compatible private method: return expanded region values.
+
+        Provided for backward-compatibility with earlier internal usage where
+        "query" implied applying RegionConfig. Prefer using ``_fetch_region``
+        when you need both values and the effective coordinates.
+        """
+        arr, _ = self._fetch_region(region, expand=False)
+        return arr
+
+    # --------------------------- binning helpers -----------------------------
+    def _mean_bins_from_edges(self, arr: np.ndarray, edges: np.ndarray) -> np.ndarray:
+        """Return mean of slices defined by half-open bin edges.
+
+        Assumes ``edges`` are monotonically non-decreasing. Last edge is clamped
+        to array length. Empty bins yield NaN (later caller may keep or replace).
+        """
+        if arr.size == 0 or edges.size <= 1:
+            return np.zeros(max(edges.size - 1, 0), dtype=np.float32)
+        e = edges.astype(np.int64)
+        e[-1] = min(e[-1], arr.size)
+        if np.any(e[1:] < e[:-1]):
+            raise ValueError("Non-monotonic bin edges")
+        starts = e[:-1]
+        ends = e[1:]
+        # Compute means (loop acceptable; bin counts typically modest & explicit keeps clarity)
+        out = np.empty(len(starts), dtype=np.float32)
+        for i, (s, end) in enumerate(zip(starts, ends)):
+            if end > s:
+                out[i] = float(np.mean(arr[s:end]))
+            else:
+                out[i] = np.nan
         return out
 
-    def _query_binned(self, region: GenomicRegion, n_bins: int) -> np.ndarray:
-        arr = self._query_region(region.chrom, region.start, region.end)
-        if arr.size == 0:
-            return np.zeros(n_bins, dtype=np.float32)
-        edges = np.linspace(0, arr.size, n_bins + 1, dtype=np.int32)
-        sums = np.add.reduceat(arr, edges[:-1])
-        counts = (edges[1:] - edges[:-1]).clip(min=1)
-        return (sums / counts).astype(np.float32, copy=False)
-
-    def _query_multiple_regions_array(
-        self, regions: Sequence[GenomicRegion], n_bins: int
-    ) -> np.ndarray:
-        mat = np.zeros((len(regions), n_bins), dtype=np.float32)
-        for i, r in tqdm.tqdm(enumerate(regions), total=len(regions)):
-            mat[i] = self._query_binned(r, n_bins)
-        return mat
-
-    def _query_multiple_regions_parallel(
-        self,
-        regions: Sequence[GenomicRegion],
-        max_workers: int = 4,
-        prefer_distinct_chunks: bool = True,
-        as_xarray: bool = False,
-        pad_value: float = np.nan,
-    ) -> dict[str, np.ndarray]:
-        """Parallel region querying minimizing overlapping chunk reads.
-
-        Strategy:
-          1. Split regions into per-chunk pieces.
-          2. Group pieces by chunk.
-          3. Schedule groups across a thread pool so workers mostly handle
-             disjoint chunks (round-robin) to reduce simultaneous access to
-             same underlying storage.
-
-                Returns:
-                        dict(region_str -> np.ndarray) by default.
-                        If as_xarray=True (and xarray installed), returns an xarray.Dataset
-                        with variable-length regions padded to 'pad_value'. Dimensions:
-                            - region: region index (with region string coordinate labels)
-                            - position: 0..(max_region_length-1) offset within region
-                        Dataset variables:
-                            - signal: (region, position) float32
-                            - length: (region,) original lengths
-        """
-        if not regions:
-            return {}
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        plan = self._plan_regions_by_chunk(regions)
-        # Pre-allocate containers for region assembly
-        region_parts: dict[str, list[tuple[int, np.ndarray]]] = {}
-
-        # Ordering of chunk groups: sort by dataset then chunk index
-        chunk_groups = sorted(plan.items(), key=lambda kv: (kv[0][0], kv[0][1]))
-        if prefer_distinct_chunks:
-            # Interleave groups to spread out adjacent chunk indices
-            even = chunk_groups[0::2]
-            odd = chunk_groups[1::2]
-            chunk_groups = even + odd
-
-        def process_group(key, pieces):
-            ds_name, chunk_idx = key
-            arr = self.data[ds_name]
-            chunk_len = arr.chunks[0] if hasattr(arr, "chunks") else arr.shape[0]
-            c_start = chunk_idx * chunk_len
-            c_end = min(c_start + chunk_len, arr.shape[0])
-            # Load chunk slice once
-            chunk_view = arr[c_start:c_end]
-            out_local = []
-            for p in pieces:
-                local_s = p["start"] - c_start
-                local_e = p["end"] - c_start
-                sub = chunk_view[local_s:local_e]
-                out_local.append((p["region"], p["start"], sub))
-            return out_local
-
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [
-                pool.submit(process_group, key, pieces) for key, pieces in chunk_groups
-            ]
-            for fut in as_completed(futures):
-                for region_obj, abs_start, sub_vals in fut.result():
-                    rid = str(region_obj)
-                    region_parts.setdefault(rid, []).append((abs_start, sub_vals))
-
-        # Assemble full arrays per region (pieces are non-overlapping)
-        result: dict[str, np.ndarray] = {}
-        for r in regions:
-            rid = str(r)
-            if rid not in region_parts:
-                result[rid] = np.empty(0, dtype=np.float32)
-                continue
-            pieces = sorted(region_parts[rid], key=lambda t: t[0])
-            vals = (
-                np.concatenate([p[1] for p in pieces])
-                if len(pieces) > 1
-                else pieces[0][1]
-            )
-            # Ensure float32 output
-            result[rid] = vals.astype(np.float32, copy=False)
-        if not as_xarray:
-            return result
-        else:
-            return self._result_to_xarray(regions, result, pad_value)
-
-    def query_region(
-        self, region: GenomicRegion, *, n_bins: int | None = None
-    ) -> np.ndarray:
+    # Unified helper -------------------------------------------------------
+    def _edges_for_fixed(self, length: int, *, n_bins: int | None = None, bin_size: int | None = None) -> np.ndarray:
         if n_bins is not None:
-            return self._query_binned(region, n_bins)
-        return self._query_region(region.chrom, region.start, region.end)
+            return np.linspace(0, length, n_bins + 1)
+        if bin_size and bin_size > 0:
+            n = int(np.ceil(length / bin_size))
+            return np.arange(0, n * bin_size + 1, bin_size)
+        return np.array([0, length], dtype=np.int64)
 
+    def _bin_fixed_window(self, arr: np.ndarray) -> np.ndarray:
+        rc = self.region_config
+        edges = self._edges_for_fixed(arr.size, n_bins=rc.n_bins, bin_size=rc.bin_size)
+        if edges.size == 2 and edges[1] - edges[0] == arr.size and rc.n_bins is None and (not rc.bin_size or rc.bin_size == 0):
+            return arr.astype(np.float32, copy=False)
+        edges[-1] = max(edges[-1], arr.size)  # clamp
+        return self._mean_bins_from_edges(arr, edges)
+
+    def _bin_scale_regions(self, region: GenomicRegion, arr: np.ndarray, expanded: GenomicRegion) -> np.ndarray:
+        rc = self.region_config
+        bin_size = rc.bin_size
+        if bin_size <= 0:
+            raise ValueError("bin_size must be >0 in scale-regions mode for binning")
+
+        # --- Segment index calculation (expanded coordinates) ---
+        orig_body_len = max(0, region.end - region.start)
+        upstream = rc.upstream
+        un5 = rc.unscaled_5_prime
+        un3 = rc.unscaled_3_prime
+        downstream = rc.downstream
+
+        idx_up_end = upstream
+        idx_un5_end = idx_up_end + un5
+        idx_body_end = idx_un5_end + orig_body_len
+        idx_un3_end = idx_body_end + un3
+        idx_down_end = idx_un3_end + downstream
+
+        def slice_safe(a: int, b: int) -> np.ndarray:
+            return arr[max(0, a): min(len(arr), b)]
+
+        upstream_arr = slice_safe(0, idx_up_end)
+        un5_arr = slice_safe(idx_up_end, idx_un5_end)
+        body_arr = slice_safe(idx_un5_end, idx_body_end)
+        un3_arr = slice_safe(idx_body_end, idx_un3_end)
+        downstream_arr = slice_safe(idx_un3_end, idx_down_end)
+
+        # Helper for simple fixed-size binning of a segment
+        def bin_segment(seg: np.ndarray) -> np.ndarray:
+            if seg.size == 0:
+                return np.zeros(0, dtype=np.float32)
+            edges = self._edges_for_fixed(seg.size, bin_size=bin_size)
+            edges[-1] = max(edges[-1], seg.size)
+            return self._mean_bins_from_edges(seg, edges)
+
+        # Body scaling: proportional mapping into target number of bins
+        body_target = rc.body
+        if body_target % bin_size != 0:
+            raise ValueError("body must be multiple of bin_size for scale-regions binning")
+        target_bins = body_target // bin_size
+        if target_bins > 0:
+            if body_arr.size == 0:
+                body_binned = np.zeros(target_bins, dtype=np.float32)
+            else:
+                # Map original body to target bins via linspace of edges
+                edges = np.linspace(0, body_arr.size, target_bins + 1)
+                body_binned = self._mean_bins_from_edges(body_arr, edges)
+        else:
+            body_binned = np.zeros(0, dtype=np.float32)
+
+        return np.concatenate([
+            bin_segment(upstream_arr),
+            bin_segment(un5_arr),
+            body_binned,
+            bin_segment(un3_arr),
+            bin_segment(downstream_arr),
+        ])
+
+    # --------------------------- public binning API ---------------------------
+    def query_region(self, region: GenomicRegion, binned: bool = False) -> np.ndarray:
+        """Return raw or binned signal for a single region.
+
+        Parameters
+        ----------
+        region : GenomicRegion
+            Input genomic interval (unexpanded coordinates).
+        binned : bool, default False
+            If True apply binning logic according to RegionConfig.
+
+        Notes
+        -----
+        For scale-regions mode the original region defines the "body" that is
+        proportionally scaled; we therefore expand once to obtain the full
+        window and must avoid a second expansion (a previous implementation
+        performed an inadvertent double expansion). This method now uses
+        ``_fetch_region(expand=True)`` once and, for scale-regions, separately
+        obtains the expanded coordinates to segment the array.
+        """
+        if not binned:
+            return self._query_region(region, expand=False)
+
+        if self.region_config.mode == 'reference-point':
+            raw, _ = self._fetch_region(region, expand=True)
+            return self._bin_fixed_window(raw)
+
+        # scale-regions: expand exactly once, fetch expanded raw without re-expanding
+        expanded = self._expand_region(region)
+        if expanded is None:
+            return np.empty(0, dtype=np.float32)
+        expanded_raw, _ = self._fetch_region(expanded, expand=False)
+        return self._bin_scale_regions(region, expanded_raw, expanded)
+
+    # --------------------------- multi-region API ---------------------------
     def query_regions(
         self,
-        regions: Sequence[GenomicRegion],
+        regions: list[GenomicRegion] | tuple[GenomicRegion, ...],
         *,
-        n_threads: int | None = None,
-    ) -> dict[str, np.ndarray]:
-        pass
+        binned: bool = False,
+        stack: bool = False,
+        pad_value: float = np.nan,
+        show_progress: bool = False,
+        as_xarray: bool = False,
+    ):
+        """Query multiple regions.
 
+        Parameters
+        ----------
+        regions : sequence[GenomicRegion]
+            Regions to extract (interpreted as unexpanded coordinates).
+        binned : bool, default False
+            Apply binning per RegionConfig.
+        stack : bool, default False
+            If True, return a 2D ndarray (n_regions, width) when widths are
+            uniform (binned=True) or a padded matrix (raw) using `pad_value`.
+        pad_value : float, default NaN
+            Fill value for padding when stacking variable length raw regions.
+        show_progress : bool, default False
+            Display tqdm progress bar.
+        as_xarray : bool, default False
+            If True and xarray is installed, return an xarray Dataset with
+            dimensions (region, position) or (region, bin).
 
-class ReferencePoint(Enum):
-    START = "start"
-    CENTER = "center"
-    END = "end"
-    SCALE = "scale"
+        Returns
+        -------
+        dict | np.ndarray | xr.Dataset
+            By default a dict mapping region string -> np.ndarray. If stack=True
+            returns (matrix, region_ids, lengths) unless as_xarray=True.
+        """
+        if not regions:
+            return {} if not stack else (np.zeros((0, 0), dtype=np.float32), [], [])
 
+        iterator = regions
+        if show_progress:
+            iterator = tqdm.tqdm(regions, desc="regions")  # type: ignore
 
-class RegionConfig(BaseModel):
-    bin_size: int | None = None
-    n_bins: int | None = None
-    reference_point: ReferencePoint = ReferencePoint.CENTER
-    bp_before: int = Field(0, ge=0)
-    bp_after: int = Field(0, ge=0)
+        out: dict[str, np.ndarray] = {}
+        for r in iterator:  # type: ignore
+            try:
+                arr = self.query_region(r, binned=binned)
+            except KeyError:
+                if self.query_config.error_on_missing_chromosome:
+                    raise
+                arr = np.empty(0, dtype=np.float32)
+            out[str(r)] = arr.astype(np.float32, copy=False)
 
-    # Validate that either bin_size or n_bins is set
-    @field_validator("bin_size", "n_bins", pre=True, always=True)
-    def validate_bin_size_or_n_bins(cls, v, values, field):
-        if field.name == "bin_size" and v is None and values.get("n_bins") is None:
-            raise ValueError("Either bin_size or n_bins must be set.")
-        if field.name == "n_bins" and v is None and values.get("bin_size") is None:
-            raise ValueError("Either bin_size or n_bins must be set.")
-        return v
+        if not stack and not as_xarray:
+            return out
+
+        # Determine uniform length expectation
+        region_ids = list(out.keys())
+        arrays = [out[rid] for rid in region_ids]
+        lengths = np.array([a.size for a in arrays], dtype=np.int32)
+        uniform = np.all(lengths == lengths[0]) if lengths.size else True
+
+        if binned and not uniform:
+            # Defensive: binned outputs should be uniform; raise to warn user.
+            raise ValueError("Binned outputs have differing lengths; check config")
+
+        if uniform:
+            mat = (
+                np.vstack([a for a in arrays])
+                if lengths.size and lengths[0] > 0
+                else np.zeros((len(arrays), 0), dtype=np.float32)
+            )
+        else:
+            max_len = int(lengths.max(initial=0))
+            mat = np.full((len(arrays), max_len), pad_value, dtype=np.float32)
+            for i, a in enumerate(arrays):
+                if a.size:
+                    mat[i, : a.size] = a
+
+        if as_xarray:
+            try:
+                import xarray as xr  # type: ignore
+            except Exception:  # pragma: no cover
+                raise ImportError("xarray not installed; install to use as_xarray=True")
+            dims = ("region", "bin" if binned else "position")
+            ds = xr.Dataset(
+                {
+                    "signal": (dims, mat),
+                    "length": (("region",), lengths),
+                },
+                coords={
+                    "region": region_ids,
+                    dims[1]: np.arange(mat.shape[1], dtype=np.int32),
+                },
+                attrs={
+                    "source": "wignado.zarrstore",
+                    "binned": binned,
+                    "pad_value": float(pad_value),
+                },
+            )
+            return ds
+
+        return (mat, region_ids, lengths) if stack else out
+
+__all__ = [
+    "ValueDType",
+    "ZarrConverterConfig",
+    "BigWigToZarrConverter",
+    "QueryConfig",
+    "ReferencePoint",
+    "RegionConfig",
+    "ZarrQueryEngine",
+]
