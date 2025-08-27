@@ -123,6 +123,8 @@ class BigWigToZarrConverter:
         self.cfg = config or ZarrConverterConfig()
         self._validate_inputs()
 
+        self.compressor = zarr.codecs.BloscCodec(cname='zstd', clevel=self.cfg.compression_level, shuffle=zarr.codecs.BloscShuffle.bitshuffle)
+
     def _validate_inputs(self) -> None:
         if not self.bigwig_path.exists():
             raise FileNotFoundError(f"BigWig file not found: {self.bigwig_path}")
@@ -235,7 +237,7 @@ class BigWigToZarrConverter:
                 shape=(length,),
                 chunks=chunks,
                 dtype=value_dtype,
-                compressor=Zstd(level=self.cfg.compression_level),
+                compressors=self.compressor,
                 overwrite=True,
                 fill_value=self.cfg.zero_fill_value,
             )
@@ -407,11 +409,15 @@ class ZarrQueryEngine:
                 anchor = region.end
             else:  # center / default
                 anchor = (region.start + region.end) // 2
+            
             new_start = anchor - self.region_config.bp_before
             new_end = anchor + self.region_config.bp_after
+            
             if new_end < new_start:
-                new_end = new_start
-            return GenomicRegion(chrom=chrom_name, start=new_start, end=new_end)
+                new_end = new_start + 1
+
+            return GenomicRegion(chrom=chrom_name, start=new_start, end=new_end, name=region.name)
+
         # scale-regions: build outer window spanning flanks + body + internal unscaled segments
         new_start = region.start - (
             self.region_config.upstream + self.region_config.unscaled_5_prime
@@ -420,8 +426,8 @@ class ZarrQueryEngine:
             self.region_config.downstream + self.region_config.unscaled_3_prime
         )
         if new_end < new_start:
-            new_end = new_start
-        return GenomicRegion(chrom=chrom_name, start=new_start, end=new_end)
+            new_end = new_start + 1
+        return GenomicRegion(chrom=chrom_name, start=new_start, end=new_end, name=region.name)
 
     # ------------------------------------------------------------------
     # Low-level data access
@@ -712,12 +718,3 @@ class ZarrQueryEngine:
 
         return (mat, region_ids, lengths) if stack else out
 
-__all__ = [
-    "ValueDType",
-    "ZarrConverterConfig",
-    "BigWigToZarrConverter",
-    "QueryConfig",
-    "ReferencePoint",
-    "RegionConfig",
-    "ZarrQueryEngine",
-]
